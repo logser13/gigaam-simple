@@ -1,0 +1,5 @@
+torch==2.6.0
+torchaudio==2.6.0
+imageio-ffmpeg==0.6.0
+silero-vad==6.2.3
+-e ./vendor/GigaAM
