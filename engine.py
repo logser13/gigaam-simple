@@ -181,7 +181,8 @@ def ffmpeg_path():
 def validate_fragment(segment):
     if not (math.isfinite(segment.start) and math.isfinite(segment.end)
             and 0 <= segment.start < segment.end and segment.end - segment.start <= 24.001):
-        raise ValueError('Выберите фрагмент с корректными таймкодами длительностью до 24 секунд.')
+        raise ValueError('Для прослушивания или повтора выберите фрагмент с корректными таймкодами до 24 секунд. '
+                         'Длинный аудиофайл можно обработать целиком кнопкой «Распознать».')
 
 
 def convert_audio(source, target, stop, segment=None):
