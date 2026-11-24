@@ -17,6 +17,25 @@ def write_wav(path, samples, rate=16000):
 
 
 class AudioTests(unittest.TestCase):
+    def test_pcm_decoder_receives_each_speech_fragment_without_temp_wav(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'input.wav'
+            samples = [1000] * 16000 + [-2000] * 16000
+            write_wav(path, samples)
+            received = []
+            segments = []
+
+            def decode(pcm):
+                received.append(pcm)
+                return 'Готовый фрагмент.'
+
+            transcribe_wav(path, None, threading.Event(), lambda *_: None,
+                           speech_ranges=[(16000, 32000)], on_segment=segments.append,
+                           decode_pcm=decode)
+            self.assertEqual(received, [array.array('h', samples[16000:]).tobytes()])
+            self.assertEqual([(item.start, item.end, item.text) for item in segments],
+                             [(1, 2, 'Готовый фрагмент.')])
+
     def test_long_audio_is_preserved_without_gaps_or_duplicates(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'input.wav'

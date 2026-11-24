@@ -7,7 +7,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
-from engine import Cancelled, Engine, ROOT
+from engine import Cancelled, Engine, MODEL_NAME, PREFERRED_MODEL, ROOT, model_available
 from audio_preview import AudioPlayer, prepare_preview
 from transcript import (Segment, TIMED_HEADER, clean_text, format_timestamp, render_transcript,
                         replace_timed_segment, save_versions, segment_at_position, timed_blocks)
@@ -15,11 +15,52 @@ from transcript import (Segment, TIMED_HEADER, clean_text, format_timestamp, ren
 logging.basicConfig(filename=str(ROOT / 'app.log'), encoding='utf-8', level=logging.INFO,
                     format='%(asctime)s %(levelname)s %(message)s')
 
+MODEL_CHOICES = {'Альтернативная': PREFERRED_MODEL, 'Обычная': MODEL_NAME}
+BACKGROUND = '#edf3f4'
+SURFACE = '#ffffff'
+TEXT = '#142b32'
+MUTED = '#45606a'
+ACCENT = '#08685d'
+OUTLINE = '#a8bdc1'
+ICON = ROOT / 'assets' / 'gigaam.ico'
+
+
+def configure_theme(root):
+    style = ttk.Style(root)
+    style.theme_use('clam')
+    style.configure('.', font=('Segoe UI', 10))
+    style.configure('TFrame', background=BACKGROUND)
+    style.configure('TLabel', background=BACKGROUND, foreground=TEXT)
+    style.configure('Card.TFrame', background=SURFACE)
+    style.configure('Card.TLabel', background=SURFACE, foreground=TEXT)
+    style.configure('Muted.TLabel', background=SURFACE, foreground=MUTED)
+    style.configure('TButton', background=SURFACE, foreground=TEXT, bordercolor=OUTLINE,
+                    lightcolor=SURFACE, darkcolor=SURFACE, padding=(12, 8))
+    style.map('TButton', background=[('disabled', '#edf3f4'), ('pressed', '#d2e5e4'), ('active', '#e1efee')],
+              foreground=[('disabled', '#536b73')], bordercolor=[('focus', ACCENT)])
+    style.configure('Accent.TButton', background=ACCENT, foreground='white', bordercolor=ACCENT,
+                    lightcolor=ACCENT, darkcolor=ACCENT)
+    style.map('Accent.TButton', background=[('disabled', '#e1ebeb'), ('pressed', '#05483e'), ('active', '#07584e')],
+              foreground=[('disabled', '#48616a')], bordercolor=[('focus', '#102f39')])
+    style.configure('TCombobox', padding=(6, 5), foreground=TEXT, bordercolor=OUTLINE)
+    style.map('TCombobox', fieldbackground=[('readonly', SURFACE), ('disabled', BACKGROUND)],
+              foreground=[('readonly', TEXT), ('disabled', MUTED)], bordercolor=[('focus', ACCENT)])
+    style.configure('TCheckbutton', background=SURFACE, foreground=TEXT)
+    style.map('TCheckbutton', background=[('active', '#eef6f5')])
+    style.configure('TNotebook', background=BACKGROUND, bordercolor=OUTLINE)
+    style.configure('TNotebook.Tab', padding=(14, 7), background='#e1ebed', foreground=TEXT)
+    style.map('TNotebook.Tab', background=[('selected', SURFACE), ('active', '#d0e5e4')],
+              foreground=[('selected', ACCENT)])
+    style.configure('Horizontal.TProgressbar', troughcolor='#e1ebed', background=ACCENT,
+                    bordercolor='#e1ebed', lightcolor=ACCENT, darkcolor=ACCENT, thickness=5)
+
 
 class App:
     def __init__(self, root):
         self.root = root
-        self.engine = Engine()
+        starting_choice = ('Обычная' if model_available(MODEL_NAME) and not model_available(PREFERRED_MODEL)
+                           else 'Альтернативная')
+        self.engine = Engine(MODEL_CHOICES[starting_choice])
         self.events = queue.Queue()
         self.stop = threading.Event()
         self.busy = False
@@ -32,89 +73,101 @@ class App:
         self.generated_clean = ''
         self.segments = []
         self.remove_acknowledgements = tk.BooleanVar(value=True)
-        self.model_choice = tk.StringVar(value='Обычная')
+        self.model_choice = tk.StringVar(value=starting_choice)
         self.player = AudioPlayer()
         self.preview_stop = threading.Event()
         self.preview_generation = 0
         self.preview_preparing = False
         self.preview_thread = None
         self.closed = False
-        root.title('GigaAM - аудио в текст · версия 3')
+        root.title('GigaAM Simple - аудио в текст')
         root.geometry('900x720')
         root.minsize(680, 640)
-        root.configure(bg='#f4f6fa')
-        style = ttk.Style(root)
-        style.theme_use('clam')
-        style.configure('.', font=('Segoe UI', 11))
-        style.configure('TFrame', background='#f4f6fa')
-        style.configure('TLabel', background='#f4f6fa', foreground='#172033')
-        style.configure('TButton', padding=(14, 10))
-        style.configure('Accent.TButton', background='#2563eb', foreground='white')
-        style.map('Accent.TButton', background=[('active', '#1d4ed8'), ('disabled', '#d9e0ec')],
-                  foreground=[('disabled', '#475569')])
-        frame = ttk.Frame(root, padding=16)
+        root.configure(bg=BACKGROUND)
+        if ICON.is_file():
+            root.iconbitmap(default=str(ICON))
+        configure_theme(root)
+        header = tk.Frame(root, bg='#16373e', padx=24, pady=14)
+        header.pack(fill='x')
+        tk.Label(header, text='Аудио в текст', font=('Segoe UI', 23, 'bold'),
+                 bg='#16373e', fg=SURFACE).pack(side='left')
+        tk.Label(header, text='Локально · GigaAM v3', font=('Segoe UI', 10),
+                 bg='#16373e', fg='#b8e4dc').pack(side='right')
+
+        frame = ttk.Frame(root, padding=(20, 14))
         frame.pack(fill='both', expand=True)
-        ttk.Label(frame, text='Аудио в текст', font=('Segoe UI', 23, 'bold')).pack(anchor='w')
-        ttk.Label(frame, text='Русская речь · GigaAM v3 · обработка на этом компьютере').pack(anchor='w', pady=(4, 12))
-        row = ttk.Frame(frame)
+        source_card = ttk.Frame(frame, style='Card.TFrame', padding=(14, 12))
+        source_card.pack(fill='x', pady=(0, 12))
+        row = ttk.Frame(source_card, style='Card.TFrame')
         row.pack(fill='x')
         self.choose = ttk.Button(row, text='Выбрать аудиофайл', command=self.pick)
         self.choose.pack(side='left')
         self.open_text = ttk.Button(row, text='Открыть TXT', command=self.pick_text)
-        self.open_text.pack(side='left', padx=10)
-        self.filename = tk.StringVar(value='MP3, WAV, M4A, OGG, FLAC или другой аудиофайл')
-        ttk.Label(frame, textvariable=self.filename, wraplength=620).pack(anchor='w', pady=(8, 10))
-        actions = ttk.Frame(frame)
+        self.open_text.pack(side='right')
+        self.filename = tk.StringVar(value='MP3, WAV, M4A, OGG, FLAC')
+        source_label = ttk.Label(source_card, textvariable=self.filename, style='Muted.TLabel', wraplength=620)
+        source_label.pack(anchor='w', pady=(6, 10))
+        actions = ttk.Frame(source_card, style='Card.TFrame')
         actions.pack(fill='x')
+        ttk.Label(actions, text='Модель', style='Card.TLabel').pack(side='left', padx=(0, 8))
+        self.model_combo = ttk.Combobox(actions, textvariable=self.model_choice,
+                                       values=tuple(MODEL_CHOICES), state='readonly', width=17)
+        self.model_combo.pack(side='left')
         self.run_button = ttk.Button(actions, text='Распознать', style='Accent.TButton',
                                      command=self.start, state='disabled')
-        self.run_button.pack(side='left')
         self.cancel = ttk.Button(actions, text='Остановить', command=self.request_stop, state='disabled')
-        self.cancel.pack(side='left', padx=10)
-        ttk.Label(actions, text='Модель:').pack(side='left', padx=(8, 6))
-        self.model_combo = ttk.Combobox(actions, textvariable=self.model_choice,
-                                       values=('Обычная', 'Альтернативная'), state='readonly', width=17)
-        self.model_combo.pack(side='left')
-        self.progress = ttk.Progressbar(frame, maximum=100)
-        self.progress.pack(fill='x', pady=(12, 6))
-        self.status = tk.StringVar(value='Выберите аудио или откройте готовый TXT для очистки.')
-        ttk.Label(frame, textvariable=self.status, wraplength=620).pack(anchor='w', pady=(0, 8))
+        self.cancel.pack(side='right')
+        self.run_button.pack(side='right', padx=(8, 8))
+        self.progress = ttk.Progressbar(source_card, maximum=100)
+        self.progress.pack(fill='x', pady=(10, 5))
+        self.status = tk.StringVar(value='Выберите запись, чтобы начать.')
+        status_label = ttk.Label(source_card, textvariable=self.status, style='Muted.TLabel', wraplength=620)
+        status_label.pack(anchor='w')
+        source_card.bind('<Configure>', lambda event: (
+            source_label.configure(wraplength=max(200, event.width - 28)),
+            status_label.configure(wraplength=max(200, event.width - 28))))
+
         footer = ttk.Frame(frame)
-        footer.pack(side='bottom', fill='x', pady=(14, 0))
+        footer.pack(side='bottom', fill='x', pady=(10, 0))
         self.copy_button = ttk.Button(footer, text='Копировать', command=self.copy, state='disabled')
         self.copy_button.pack(side='left')
-        self.save_button = ttk.Button(footer, text='Сохранить обе версии', command=self.save, state='disabled')
-        self.save_button.pack(side='left', padx=10)
+        self.save_button = ttk.Button(footer, text='Сохранить обе версии', style='Accent.TButton',
+                                      command=self.save, state='disabled')
+        self.save_button.pack(side='right')
         self.clean_button = ttk.Button(footer, text='Очистить заново', command=self.restore_cleaned, state='disabled')
-        self.clean_button.pack(side='left')
+        self.clean_button.pack(side='left', padx=8)
         review = ttk.Frame(frame)
-        review.pack(fill='x', pady=(0, 8))
+        review.pack(side='bottom', fill='x', pady=(8, 0))
         self.play_button = ttk.Button(review, text='Прослушать', command=self.play_selected, state='disabled')
         self.play_button.pack(side='left')
         self.stop_audio_button = ttk.Button(review, text='Стоп звук', command=self.stop_preview, state='disabled')
         self.stop_audio_button.pack(side='left', padx=8)
-        self.retry_button = ttk.Button(review, text='Распознать фрагмент', command=self.retry_selected, state='disabled')
+        self.retry_button = ttk.Button(review, text='Повторить фрагмент', command=self.retry_selected, state='disabled')
         self.retry_button.pack(side='left')
         self.notebook = ttk.Notebook(frame)
+        self.notebook.enable_traversal()
         self.notebook.pack(fill='both', expand=True)
-        raw_tab = ttk.Frame(self.notebook)
-        clean_tab = ttk.Frame(self.notebook)
+        raw_tab = ttk.Frame(self.notebook, style='Card.TFrame')
+        clean_tab = ttk.Frame(self.notebook, style='Card.TFrame')
         self.notebook.add(raw_tab, text='Исходный')
         self.notebook.add(clean_tab, text='Очищенный')
-        self.raw_view = ScrolledText(raw_tab, font=('Segoe UI', 12), wrap='word', height=8,
-                                    bg='white', fg='#172033', padx=12, pady=12, state='disabled')
+        editor = dict(font=('Segoe UI', 12), wrap='word', height=4, bg=SURFACE, fg=TEXT,
+                      insertbackground=TEXT, selectbackground='#caeae3', selectforeground=TEXT,
+                      relief='flat', highlightthickness=1, highlightbackground=SURFACE, highlightcolor=ACCENT,
+                      padx=12, pady=10, spacing3=3)
+        self.raw_view = ScrolledText(raw_tab, **editor, state='disabled')
         self.raw_view.pack(fill='both', expand=True)
         self.ack_checkbox = ttk.Checkbutton(clean_tab, text='Убирать «угу», «ага» и «мгм»',
                                             variable=self.remove_acknowledgements, command=self.restore_cleaned)
-        self.ack_checkbox.pack(anchor='w', padx=8, pady=(6, 0))
-        ttk.Label(clean_tab, text='Нажмите на таймкод для прослушивания. Имена и числа проверьте по записи.',
-                  wraplength=600).pack(anchor='w', padx=8, pady=(2, 6))
-        self.text = ScrolledText(clean_tab, font=('Segoe UI', 12), wrap='word', height=8,
-                                bg='white', fg='#172033', padx=12, pady=12, undo=True)
+        self.ack_checkbox.pack(anchor='w', padx=12, pady=(8, 0))
+        ttk.Label(clean_tab, text='Нажмите на таймкод, чтобы прослушать фрагмент.',
+                  style='Muted.TLabel').pack(anchor='w', padx=12, pady=(2, 4))
+        self.text = ScrolledText(clean_tab, **editor, undo=True)
         self.text.pack(fill='both', expand=True)
         self.notebook.select(clean_tab)
         for widget in (self.raw_view, self.text):
-            widget.tag_configure('timestamp', foreground='#2563eb', underline=True)
+            widget.tag_configure('timestamp', foreground=ACCENT, underline=True,
+                                 font=('Consolas', 10))
             widget.tag_bind('timestamp', '<ButtonRelease-1>', lambda event, w=widget: self.timestamp_clicked(w, event))
             widget.bind('<ButtonRelease-1>', lambda event, w=widget: self.cursor_changed(w, event), add='+')
             widget.bind('<KeyRelease>', lambda event: self.update_review_controls(), add='+')
@@ -253,7 +306,7 @@ class App:
         self.status.set('Останавливаю... Текущий фрагмент завершится, готовый текст останется.')
 
     def select_engine(self):
-        name = 'v3_e2e_rnnt' if self.model_choice.get() == 'Альтернативная' else 'v3_e2e_ctc'
+        name = MODEL_CHOICES[self.model_choice.get()]
         if self.engine.model_name != name:
             self.engine = Engine(name)
 

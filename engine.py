@@ -2,19 +2,21 @@
 import array
 import math
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import wave
+from contextlib import nullcontext
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from transcript import Segment
 
 ROOT = Path(__file__).resolve().parent
 MODEL_NAME = 'v3_e2e_ctc'
-SUPPORTED_MODELS = ('v3_e2e_ctc', 'v3_e2e_rnnt')
+PREFERRED_MODEL = 'v3_e2e_rnnt'
+SUPPORTED_MODELS = (MODEL_NAME, PREFERRED_MODEL)
 RATE = 16000
 
 
@@ -133,7 +135,24 @@ def detect_speech_ranges(path, vad_model, stop, on_status):
     return [(r['start'], r['end']) for r in ranges]
 
 
-def transcribe_wav(path, model, stop, on_part, speech_ranges=None, on_segment=None):
+def normalize_result(result):
+    return str(getattr(result, 'text', result)).strip().replace('\u2014', '-').replace('\u2013', '-')
+
+
+def recognize_pcm(model, pcm):
+    """Use the pinned GigaAM v3 frontend and decoder on mono 16 kHz PCM."""
+    import torch
+
+    with torch.inference_mode():
+        samples = torch.frombuffer(bytearray(pcm), dtype=torch.int16).float().div_(32768.0)
+        wav = samples.unsqueeze(0)
+        length = torch.tensor([samples.numel()])
+        encoded, encoded_length = model(wav, length)
+        text, _, _ = model.decoding.decode(model.head, encoded, encoded_length)[0]
+        return text
+
+
+def transcribe_wav(path, model, stop, on_part, speech_ranges=None, on_segment=None, *, decode_pcm=None):
     texts = []
     iterator = iter_chunks(path) if speech_ranges is None else iter_speech_chunks(path, speech_ranges)
     if speech_ranges is not None:
@@ -143,20 +162,22 @@ def transcribe_wav(path, model, stop, on_part, speech_ranges=None, on_segment=No
         with wave.open(str(path), 'rb') as audio:
             total_speech = audio.getnframes()
     processed = 0
-    with tempfile.TemporaryDirectory(prefix='gigaam-clips-') as directory:
-        clip = Path(directory) / 'clip.wav'
+    workspace = tempfile.TemporaryDirectory(prefix='gigaam-clips-') if decode_pcm is None else nullcontext()
+    with workspace as directory:
         for chunk in iterator:
             if stop.is_set():
                 raise Cancelled()
-            with wave.open(str(clip), 'wb') as f:
-                f.setnchannels(1)
-                f.setsampwidth(2)
-                f.setframerate(RATE)
-                f.writeframes(chunk.pcm)
-            result = model.transcribe(str(clip))
-            text = str(getattr(result, 'text', result)).strip()
-            # Keep all generated UI/output text consistent with the user's preference.
-            text = text.replace('\u2014', '-').replace('\u2013', '-')
+            if decode_pcm is None:
+                clip = Path(directory) / 'clip.wav'
+                with wave.open(str(clip), 'wb') as f:
+                    f.setnchannels(1)
+                    f.setsampwidth(2)
+                    f.setframerate(RATE)
+                    f.writeframes(chunk.pcm)
+                result = model.transcribe(str(clip))
+            else:
+                result = decode_pcm(chunk.pcm)
+            text = normalize_result(result)
             if text:
                 texts.append(text)
                 if on_segment is not None:
@@ -216,6 +237,11 @@ def convert_audio(source, target, stop, segment=None):
                     process.wait()
 
 
+def model_available(name):
+    assets = ROOT / 'models'
+    return all((assets / (name + suffix)).is_file() for suffix in ('.ckpt', '_tokenizer.model'))
+
+
 class Engine:
     def __init__(self, model_name=MODEL_NAME):
         if model_name not in SUPPORTED_MODELS:
@@ -223,27 +249,21 @@ class Engine:
         self.model_name = model_name
         self.model = None
         self.vad_model = None
+        self.decode_pcm = None
 
     def load(self):
         assets = ROOT / 'models'
-        required = [assets / (self.model_name + '.ckpt'), assets / (self.model_name + '_tokenizer.model')]
-        if not all(p.is_file() for p in required):
-            if self.model_name == 'v3_e2e_rnnt':
+        if not model_available(self.model_name):
+            if self.model_name == PREFERRED_MODEL:
                 raise RuntimeError('Альтернативная модель ещё не скачана. Запустите Prepare-alternative.cmd с интернетом.')
             raise RuntimeError('Модель ещё не скачана. Запустите setup.ps1 с интернетом.')
         import torch
         import gigaam
         from silero_vad import load_silero_vad
         torch.set_num_threads(min(4, os.cpu_count() or 2))
-        # GigaAM's audio reader calls ffmpeg by its executable name.
-        tools = ROOT / 'tools'
-        tools.mkdir(exist_ok=True)
-        binary = tools / 'ffmpeg.exe'
-        if not binary.is_file():
-            shutil.copy2(ffmpeg_path(), binary)
-        os.environ['PATH'] = str(tools) + os.pathsep + os.environ.get('PATH', '')
         self.model = gigaam.load_model(self.model_name, device='cpu', fp16_encoder=False,
                                       use_flash=False, download_root=str(assets))
+        self.decode_pcm = partial(recognize_pcm, self.model)
         self.vad_model = load_silero_vad()
 
     def transcribe_fragment(self, source, segment, stop, on_status):
@@ -263,12 +283,13 @@ class Engine:
             if stop.is_set():
                 raise Cancelled()
             with wave.open(str(clip), 'rb') as audio:
-                duration = audio.getnframes() / RATE
-                if not duration:
+                frames = audio.getnframes()
+                if not frames:
                     raise ValueError('По этим таймкодам в файле нет аудио.')
+                pcm = audio.readframes(frames) if self.decode_pcm is not None else None
             on_status('Повторно распознаю фрагмент...')
-            result = self.model.transcribe(str(clip))
-            text = str(getattr(result, 'text', result)).strip().replace('\u2014', '-').replace('\u2013', '-')
+            result = self.decode_pcm(pcm) if self.decode_pcm is not None else self.model.transcribe(str(clip))
+            text = normalize_result(result)
             if stop.is_set():
                 raise Cancelled()
             return Segment(segment.start, segment.end, text)
@@ -289,4 +310,5 @@ class Engine:
             on_status('Ищу речь и паузы...')
             ranges = detect_speech_ranges(wav, self.vad_model, stop, on_status)
             on_status('Распознаю на компьютере...')
-            return transcribe_wav(wav, self.model, stop, on_part, speech_ranges=ranges, on_segment=on_segment)
+            return transcribe_wav(wav, self.model, stop, on_part, speech_ranges=ranges, on_segment=on_segment,
+                                  decode_pcm=self.decode_pcm)

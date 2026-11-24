@@ -1,8 +1,8 @@
 """Explicit one-time download; no downloads during normal recognition."""
-from prepare_model import download
+from prepare_model import PREFERRED_MODEL, RNNT_HASH, download
 
 
 if __name__ == '__main__':
-    download('v3_e2e_rnnt.ckpt', '2730de7545ac43ad256485a462b0a27a')
-    download('v3_e2e_rnnt_tokenizer.model')
+    download(PREFERRED_MODEL + '.ckpt', RNNT_HASH)
+    download(PREFERRED_MODEL + '_tokenizer.model')
     print('Alternative model ready. Recognition works offline.', flush=True)

@@ -4,10 +4,11 @@ import shutil
 import urllib.request
 from pathlib import Path
 
-from engine import MODEL_NAME, ROOT
+from engine import MODEL_NAME, PREFERRED_MODEL, ROOT
 
 BASE = 'https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM'
 HASH = '367074d6498f426d960b25f49531cf68'
+RNNT_HASH = '2730de7545ac43ad256485a462b0a27a'
 
 
 def checksum(path):
@@ -54,4 +55,6 @@ def prepare_ffmpeg():
 if __name__ == '__main__':
     download(MODEL_NAME + '.ckpt', HASH)
     download(MODEL_NAME + '_tokenizer.model')
+    download(PREFERRED_MODEL + '.ckpt', RNNT_HASH)
+    download(PREFERRED_MODEL + '_tokenizer.model')
     prepare_ffmpeg()

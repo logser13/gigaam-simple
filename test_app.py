@@ -18,6 +18,23 @@ class AppTests(unittest.TestCase):
     def tearDown(self):
         self.root.destroy()
 
+    def test_prefers_installed_rnnt_and_retains_ctc_for_older_installation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root_path = Path(folder)
+            assets = root_path / 'models'
+            assets.mkdir()
+            for suffix in ('.ckpt', '_tokenizer.model'):
+                (assets / ('v3_e2e_ctc' + suffix)).touch()
+            with patch('engine.ROOT', root_path):
+                older_install = App(self.root)
+                self.assertEqual(older_install.model_choice.get(), 'Обычная')
+                partial = assets / 'v3_e2e_rnnt.ckpt'
+                partial.touch()
+                (assets / 'v3_e2e_rnnt_tokenizer.model').touch()
+                complete_install = App(self.root)
+                self.assertEqual(complete_install.model_choice.get(), 'Альтернативная')
+                self.assertEqual(complete_install.engine.model_name, 'v3_e2e_rnnt')
+
     def test_raw_snapshot_survives_cleaned_edits_and_save(self):
         self.app.started = time.monotonic()
         self.app.events.put(('segment', Segment(251.2, 269.6, 'Э-э, я-я не согласен на 15%.')))
