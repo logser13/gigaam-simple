@@ -3,6 +3,7 @@ import time
 import tkinter as tk
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import App
@@ -17,6 +18,30 @@ class AppTests(unittest.TestCase):
 
     def tearDown(self):
         self.root.destroy()
+
+    def test_timestamps_toggle_preserves_speakers_edits_and_playback_offsets(self):
+        self.app.set_raw_text('[00:00:12.000 - 00:00:15.000]\nСпикер 1: Исходная реплика.')
+        self.app.text.delete('2.10', '2.end')
+        self.app.text.insert('2.10', 'Ручная правка.')
+        self.app.timestamps_checkbox.invoke()
+        self.assertEqual(self.app.text.tag_cget('timestamp_line', 'elide'), '1')
+        self.app.text.tag_add('sel', '1.0', 'end-1c')
+        with patch.object(self.root, 'clipboard_clear'), patch.object(self.root, 'clipboard_append') as copy:
+            self.app.copy_visible_selection(SimpleNamespace(widget=self.app.text))
+        copy.assert_called_once_with('Спикер 1: Ручная правка.')
+        self.app.text.mark_set('insert', '2.end')
+        self.assertEqual(self.app.selected_segment().start, 12)
+        self.assertEqual(self.app.selected_segment().speaker, 1)
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / 'meeting.txt'
+            with patch('app.filedialog.asksaveasfilename', return_value=str(target)):
+                self.app.save()
+            self.assertEqual(target.read_text(encoding='utf-8-sig').strip(), 'Спикер 1: Ручная правка.')
+            original = target.with_name('meeting.original.txt').read_text(encoding='utf-8-sig')
+            self.assertEqual(original.strip(), 'Спикер 1: Исходная реплика.')
+        self.app.timestamps_checkbox.invoke()
+        self.assertIn('00:00:12.000', self.app.text.get('1.0', 'end'))
+        self.assertIn('Ручная правка.', self.app.text.get('1.0', 'end'))
 
     def test_prefers_installed_rnnt_and_retains_ctc_for_older_installation(self):
         with tempfile.TemporaryDirectory() as folder:

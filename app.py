@@ -9,8 +9,9 @@ from tkinter.scrolledtext import ScrolledText
 
 from engine import Cancelled, Engine, MODEL_NAME, PREFERRED_MODEL, ROOT, model_available
 from audio_preview import AudioPlayer, prepare_preview
+from speakers import SETUP_HINT, available as speaker_models_available
 from transcript import (Segment, TIMED_HEADER, clean_text, format_timestamp, render_transcript,
-                        replace_timed_segment, save_versions, segment_at_position, timed_blocks)
+                        replace_timed_segment, save_versions, segment_at_position, timed_blocks, without_timestamps)
 
 logging.basicConfig(filename=str(ROOT / 'app.log'), encoding='utf-8', level=logging.INFO,
                     format='%(asctime)s %(levelname)s %(message)s')
@@ -73,6 +74,9 @@ class App:
         self.generated_clean = ''
         self.segments = []
         self.remove_acknowledgements = tk.BooleanVar(value=True)
+        self.show_timestamps = tk.BooleanVar(value=True)
+        self.separate_speakers = tk.BooleanVar(value=False)
+        self.speaker_count = tk.StringVar(value='2')
         self.model_choice = tk.StringVar(value=starting_choice)
         self.player = AudioPlayer()
         self.preview_stop = threading.Event()
@@ -118,6 +122,18 @@ class App:
         self.cancel = ttk.Button(actions, text='Остановить', command=self.request_stop, state='disabled')
         self.cancel.pack(side='right')
         self.run_button.pack(side='right', padx=(8, 8))
+        options = ttk.Frame(source_card, style='Card.TFrame')
+        options.pack(fill='x', pady=(8, 0))
+        self.speakers_checkbox = ttk.Checkbutton(options, text='Разделить по говорящим',
+                                                variable=self.separate_speakers, command=self.update_speaker_controls)
+        self.speakers_checkbox.pack(side='left')
+        ttk.Label(options, text='Спикеров', style='Card.TLabel').pack(side='left', padx=(12, 6))
+        self.speaker_combo = ttk.Combobox(options, textvariable=self.speaker_count, width=5,
+                                          values=('Авто', *(str(count) for count in range(2, 11))), state='disabled')
+        self.speaker_combo.pack(side='left')
+        self.timestamps_checkbox = ttk.Checkbutton(options, text='Показывать таймкоды',
+                                                  variable=self.show_timestamps, command=self.update_timestamp_visibility)
+        self.timestamps_checkbox.pack(side='right')
         self.progress = ttk.Progressbar(source_card, maximum=100)
         self.progress.pack(fill='x', pady=(10, 5))
         self.status = tk.StringVar(value='Выберите запись, чтобы начать.')
@@ -160,17 +176,21 @@ class App:
         self.ack_checkbox = ttk.Checkbutton(clean_tab, text='Убирать «угу», «ага» и «мгм»',
                                             variable=self.remove_acknowledgements, command=self.restore_cleaned)
         self.ack_checkbox.pack(anchor='w', padx=12, pady=(8, 0))
-        ttk.Label(clean_tab, text='Нажмите на таймкод, чтобы прослушать фрагмент.',
-                  style='Muted.TLabel').pack(anchor='w', padx=12, pady=(2, 4))
+        self.review_hint = ttk.Label(clean_tab, text='Нажмите на таймкод, чтобы прослушать фрагмент.',
+                                    style='Muted.TLabel')
+        self.review_hint.pack(anchor='w', padx=12, pady=(2, 4))
         self.text = ScrolledText(clean_tab, **editor, undo=True)
         self.text.pack(fill='both', expand=True)
         self.notebook.select(clean_tab)
         for widget in (self.raw_view, self.text):
             widget.tag_configure('timestamp', foreground=ACCENT, underline=True,
                                  font=('Consolas', 10))
+            widget.tag_configure('timestamp_line', elide=False)
             widget.tag_bind('timestamp', '<ButtonRelease-1>', lambda event, w=widget: self.timestamp_clicked(w, event))
             widget.bind('<ButtonRelease-1>', lambda event, w=widget: self.cursor_changed(w, event), add='+')
             widget.bind('<KeyRelease>', lambda event: self.update_review_controls(), add='+')
+            widget.bind('<<Copy>>', self.copy_visible_selection)
+        self.text.bind('<<Cut>>', self.cut_visible_selection)
         self.notebook.bind('<<NotebookTabChanged>>', lambda event: self.update_review_controls())
         root.protocol('WM_DELETE_WINDOW', self.close)
         root.after(100, self.poll)
@@ -239,14 +259,26 @@ class App:
         self.text.configure(state='normal')
         self.text.delete('1.0', 'end')
         self.text.insert('1.0', cleaned)
-        for widget in (self.raw_view, self.text):
-            for match in TIMED_HEADER.finditer(widget.get('1.0', 'end')):
-                widget.tag_add('timestamp', f'1.0+{match.start()}c', f'1.0+{match.end()}c')
+        self.update_timestamp_visibility()
         if self.busy:
             self.raw_view.see('end')
             self.text.see('end')
             self.text.configure(state='disabled')
         self.update_review_controls()
+
+    def update_timestamp_visibility(self):
+        visible = self.show_timestamps.get()
+        for widget in (self.raw_view, self.text):
+            for tag in ('timestamp', 'timestamp_line'):
+                widget.tag_remove(tag, '1.0', 'end')
+            for row, line in enumerate(widget.get('1.0', 'end').split('\n'), start=1):
+                if TIMED_HEADER.fullmatch(line):
+                    widget.tag_add('timestamp', f'{row}.0', f'{row}.end')
+                    widget.tag_add('timestamp_line', f'{row}.0', f'{row + 1}.0')
+            widget.tag_configure('timestamp_line', elide=not visible)
+        hint = ('Нажмите на таймкод, чтобы прослушать фрагмент.' if visible else
+                'Выберите реплику и нажмите «Прослушать».')
+        self.review_hint.configure(text=hint)
 
     def restore_cleaned(self):
         if self.busy or not self.raw_text.strip():
@@ -262,6 +294,13 @@ class App:
     def start(self):
         if self.busy or not self.path:
             return
+        speaker_count = None
+        if self.separate_speakers.get():
+            if not speaker_models_available():
+                messagebox.showinfo('Разделение по говорящим', SETUP_HINT)
+                return
+            choice = self.speaker_count.get()
+            speaker_count = -1 if choice == 'Авто' else int(choice)
         if self.raw_text.strip() and not messagebox.askyesno(
                 'Новая запись', 'Заменить текущий текст результатом новой записи?'):
             return
@@ -282,17 +321,19 @@ class App:
             button.configure(state='disabled')
         self.model_combo.configure(state='disabled')
         self.ack_checkbox.configure(state='disabled')
+        self.update_speaker_controls()
         self.update_review_controls()
         self.cancel.configure(state='normal')
         self.status.set('Запускаю...')
-        threading.Thread(target=self.work, args=(self.path,), daemon=True).start()
+        threading.Thread(target=self.work, args=(self.path, speaker_count), daemon=True).start()
 
-    def work(self, path):
+    def work(self, path, speaker_count=None):
         try:
             self.engine.transcribe(path, self.stop,
                 lambda s: self.events.put(('status', s)),
                 lambda text, p: self.events.put(('part', (text, p))),
-                on_segment=lambda segment: self.events.put(('segment', segment)))
+                on_segment=lambda segment: self.events.put(('segment', segment)),
+                speaker_count=speaker_count)
             self.events.put(('done', None))
         except Cancelled:
             self.events.put(('cancelled', None))
@@ -309,6 +350,10 @@ class App:
         name = MODEL_CHOICES[self.model_choice.get()]
         if self.engine.model_name != name:
             self.engine = Engine(name)
+
+    def update_speaker_controls(self):
+        self.speakers_checkbox.configure(state='disabled' if self.busy else 'normal')
+        self.speaker_combo.configure(state='readonly' if self.separate_speakers.get() and not self.busy else 'disabled')
 
     def selected_segment(self):
         widget = self.raw_view if self.notebook.index('current') == 0 else self.text
@@ -370,6 +415,7 @@ class App:
         except Cancelled:
             self.events.put(('preview_cancelled', generation))
         except Exception as exc:
+            logging.exception('Audio preview preparation failed')
             self.events.put(('preview_error', (generation, str(exc))))
 
     def finish_preview(self, generation):
@@ -395,6 +441,7 @@ class App:
             button.configure(state='disabled')
         self.model_combo.configure(state='disabled')
         self.ack_checkbox.configure(state='disabled')
+        self.update_speaker_controls()
         self.cancel.configure(state='normal')
         self.update_review_controls()
         self.status.set('Повторно распознаю выбранный фрагмент...')
@@ -416,7 +463,8 @@ class App:
             return False
         cleaned = self.text.get('1.0', 'end').strip()
         self.raw_text = replace_timed_segment(self.raw_text, segment)
-        clean_segment = Segment(segment.start, segment.end, clean_text(segment.text, self.remove_acknowledgements.get()))
+        clean_segment = Segment(segment.start, segment.end,
+                                clean_text(segment.text, self.remove_acknowledgements.get()), segment.speaker)
         cleaned = replace_timed_segment(cleaned, clean_segment)
         self.segments = [item for _, _, item in timed_blocks(self.raw_text)]
         self.generated_clean = clean_text(self.raw_text, self.remove_acknowledgements.get())
@@ -446,6 +494,7 @@ class App:
         self.clean_button.configure(state='normal' if has_text else 'disabled')
         self.model_combo.configure(state='readonly')
         self.ack_checkbox.configure(state='normal')
+        self.update_speaker_controls()
         self.update_review_controls()
 
     def poll(self):
@@ -466,7 +515,10 @@ class App:
                 elif kind == 'done':
                     self.finish()
                     self.progress['value'] = 100
-                    if self.raw_text.strip():
+                    if self.raw_text.strip() and self.separate_speakers.get() and not any(
+                            segment.speaker is not None for segment in self.segments):
+                        self.status.set('Текст готов. Разделить запись по говорящим не удалось.')
+                    elif self.raw_text.strip():
                         self.status.set(f'Готово за {time.monotonic() - self.started:.1f} с. Проверьте очищенный текст и сохраните обе версии.')
                     else:
                         self.status.set('Речь не распознана. Попробуйте запись с более отчётливым голосом.')
@@ -517,8 +569,24 @@ class App:
     def copy(self):
         self.root.clipboard_clear()
         selected = self.raw_text if self.notebook.index('current') == 0 else self.text.get('1.0', 'end').strip()
-        self.root.clipboard_append(selected)
+        self.root.clipboard_append(self.export_text(selected))
         self.status.set('Текст текущей вкладки скопирован.')
+
+    def copy_visible_selection(self, event):
+        if self.show_timestamps.get():
+            return None
+        widget = event.widget
+        if widget.tag_ranges('sel'):
+            visible = widget.tk.call(widget._w, 'get', '-displaychars', 'sel.first', 'sel.last')
+            self.root.clipboard_clear()
+            self.root.clipboard_append(visible)
+        return 'break'
+
+    def cut_visible_selection(self, event):
+        result = self.copy_visible_selection(event)
+        if result == 'break' and event.widget.tag_ranges('sel'):
+            event.widget.delete('sel.first', 'sel.last')
+        return result
 
     def save(self):
         target = filedialog.asksaveasfilename(title='Сохранить очищенный текст и исходную копию', defaultextension='.txt',
@@ -528,10 +596,14 @@ class App:
             try:
                 if self.imported_text_path and Path(target).resolve() == self.imported_text_path:
                     raise ValueError('Выберите другое имя. Исходный TXT не перезаписывается.')
-                raw_path, clean_path = save_versions(target, self.raw_text, self.text.get('1.0', 'end').strip())
+                raw_path, clean_path = save_versions(target, self.export_text(self.raw_text),
+                                                    self.export_text(self.text.get('1.0', 'end').strip()))
                 self.status.set(f'Сохранено: {clean_path.name} и {raw_path.name}')
             except (OSError, ValueError) as exc:
                 messagebox.showerror('Не удалось сохранить', str(exc))
+
+    def export_text(self, text):
+        return text if self.show_timestamps.get() else without_timestamps(text)
 
     def close(self):
         if self.busy:

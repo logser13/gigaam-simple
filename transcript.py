@@ -9,6 +9,7 @@ class Segment:
     start: float
     end: float
     text: str
+    speaker: int | None = None
 
 
 # Only explicit hesitation sounds and a small list of grammatical stutters.
@@ -20,6 +21,12 @@ WORD_REPEAT = re.compile(rf'\b({STUTTERS})[ \t]+\1\b', re.I)
 ACKNOWLEDGEMENTS = re.compile(r'(?<!\w)(?:угу|у-гу|ага|а-га|мгм|м-г-м)(?!\w)[,;:.!?]?[ \t]*', re.I)
 STAMP = r'\d{2,}:[0-5]\d:[0-5]\d\.\d{3}'
 TIMED_HEADER = re.compile(rf'^\[({STAMP}) - ({STAMP})\][ \t]*\r?$', re.M)
+SPEAKER_PREFIX = re.compile(r'^Спикер ([1-9]\d*):[ \t]*')
+
+
+def without_timestamps(document):
+    return ''.join(line for line in document.splitlines(keepends=True)
+                   if not TIMED_HEADER.fullmatch(line.rstrip('\n'))).strip()
 
 
 def clean_text(text, remove_acknowledgements=True):
@@ -64,7 +71,8 @@ def render_transcript(segments, timestamps=True, cleaned=False, remove_acknowled
         if not text.strip():
             continue
         prefix = f'[{format_timestamp(segment.start)} - {format_timestamp(segment.end)}]\n' if timestamps else ''
-        paragraphs.append(prefix + text)
+        speaker = f'Спикер {segment.speaker}: ' if segment.speaker is not None else ''
+        paragraphs.append(prefix + speaker + text)
     return '\n\n'.join(paragraphs)
 
 
@@ -79,7 +87,13 @@ def timed_blocks(document):
         end = headers[index + 1].start() if index + 1 < len(headers) else len(document)
         start_seconds, end_seconds = map(timestamp_seconds, match.groups())
         if end_seconds > start_seconds:
-            yield match, end, Segment(start_seconds, end_seconds, document[match.end():end].strip())
+            text = document[match.end():end].strip()
+            prefix = SPEAKER_PREFIX.match(text)
+            speaker = None
+            if prefix:
+                speaker = int(prefix[1])
+                text = text[prefix.end():].lstrip()
+            yield match, end, Segment(start_seconds, end_seconds, text, speaker)
 
 
 def segment_at_position(document, position):

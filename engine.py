@@ -78,14 +78,14 @@ def pack_speech_ranges(ranges, total_frames):
     return packed
 
 
-def iter_speech_chunks(path, ranges):
+def iter_speech_chunks(path, ranges, *, packed=False):
     with wave.open(str(path), 'rb') as audio:
         if (audio.getnchannels(), audio.getsampwidth(), audio.getframerate()) != (1, 2, RATE):
             raise ValueError('Требуется WAV: моно, 16 кГц, 16 бит.')
         total = audio.getnframes()
         if not total:
             raise ValueError('В файле нет аудио.')
-        for start, end in pack_speech_ranges(ranges, total):
+        for start, end in ranges if packed else pack_speech_ranges(ranges, total):
             while start < end:
                 audio.setpos(start)
                 pcm = audio.readframes(min(24 * RATE, end - start))
@@ -152,19 +152,51 @@ def recognize_pcm(model, pcm):
         return text
 
 
-def transcribe_wav(path, model, stop, on_part, speech_ranges=None, on_segment=None, *, decode_pcm=None):
+def ordered_speaker_ranges(turns, total_frames):
+    """Resolve overlaps once and number voices by their first retained turn."""
+    ranges = []
+    labels = {}
+    previous_end = 0
+    for start, end, speaker in sorted(turns, key=lambda turn: (turn[0], -turn[1], turn[2])):
+        start = max(previous_end, round(start * RATE))
+        end = min(total_frames, round(end * RATE))
+        if start >= end:
+            continue
+        label = labels.setdefault(speaker, len(labels) + 1)
+        if ranges and ranges[-1][2] == label and start - previous_end <= RATE // 4:
+            ranges[-1] = (ranges[-1][0], end, label)
+        else:
+            ranges.append((start, end, label))
+        previous_end = end
+    return ranges
+
+
+def iter_labeled_chunks(path, ranges):
+    for start, end, speaker in ranges:
+        for chunk in iter_speech_chunks(path, [(start, end)], packed=True):
+            yield chunk, speaker
+
+
+def transcribe_wav(path, model, stop, on_part, speech_ranges=None, on_segment=None, *, decode_pcm=None,
+                   speaker_turns=None):
     texts = []
-    iterator = iter_chunks(path) if speech_ranges is None else iter_speech_chunks(path, speech_ranges)
-    if speech_ranges is not None:
-        with wave.open(str(path), 'rb') as audio:
-            total_speech = sum(end - start for start, end in pack_speech_ranges(speech_ranges, audio.getnframes()))
+    with wave.open(str(path), 'rb') as audio:
+        total_frames = audio.getnframes()
+    if speaker_turns is not None:
+        ranges = ordered_speaker_ranges(speaker_turns, total_frames)
+        iterator = iter_labeled_chunks(path, ranges)
+        total_speech = sum(end - start for start, end, _ in ranges)
+    elif speech_ranges is not None:
+        ranges = pack_speech_ranges(speech_ranges, total_frames)
+        iterator = ((chunk, None) for chunk in iter_speech_chunks(path, ranges, packed=True))
+        total_speech = sum(end - start for start, end in ranges)
     else:
-        with wave.open(str(path), 'rb') as audio:
-            total_speech = audio.getnframes()
+        iterator = ((chunk, None) for chunk in iter_chunks(path))
+        total_speech = total_frames
     processed = 0
     workspace = tempfile.TemporaryDirectory(prefix='gigaam-clips-') if decode_pcm is None else nullcontext()
     with workspace as directory:
-        for chunk in iterator:
+        for chunk, speaker in iterator:
             if stop.is_set():
                 raise Cancelled()
             if decode_pcm is None:
@@ -181,7 +213,7 @@ def transcribe_wav(path, model, stop, on_part, speech_ranges=None, on_segment=No
             if text:
                 texts.append(text)
                 if on_segment is not None:
-                    on_segment(Segment(chunk.start_frame / RATE, chunk.end_frame / RATE, text))
+                    on_segment(Segment(chunk.start_frame / RATE, chunk.end_frame / RATE, text, speaker))
             processed += chunk.frames
             on_part(text, processed / total_speech * 100)
     if stop.is_set():
@@ -226,7 +258,11 @@ def convert_audio(source, target, stop, segment=None):
             if process.returncode:
                 errors.seek(0)
                 detail = errors.read(4000).decode('utf-8', errors='replace')
-                raise ValueError('Не удалось прочитать аудиофайл.\n' + detail)
+                error = ValueError(
+                    'Не удалось прочитать аудиофайл. Проверьте, воспроизводится ли запись целиком. '
+                    'Скачайте её заново из исходного источника или экспортируйте рабочую копию в WAV.')
+                error.add_note(f'FFmpeg exited with code {process.returncode}.\n{detail}')
+                raise error
         finally:
             if process.poll() is None:
                 process.terminate()
@@ -273,9 +309,6 @@ class Engine:
             raise ValueError('Аудиофайл не найден.')
         if stop.is_set():
             raise Cancelled()
-        if self.model is None:
-            on_status('Загружаю выбранную модель...')
-            self.load()
         with tempfile.TemporaryDirectory(prefix='gigaam-retry-') as directory:
             clip = Path(directory) / 'clip.wav'
             on_status('Подготавливаю выбранный фрагмент...')
@@ -286,29 +319,48 @@ class Engine:
                 frames = audio.getnframes()
                 if not frames:
                     raise ValueError('По этим таймкодам в файле нет аудио.')
-                pcm = audio.readframes(frames) if self.decode_pcm is not None else None
+                pcm = audio.readframes(frames)
+            if self.model is None:
+                on_status('Загружаю выбранную модель...')
+                self.load()
+            if stop.is_set():
+                raise Cancelled()
             on_status('Повторно распознаю фрагмент...')
             result = self.decode_pcm(pcm) if self.decode_pcm is not None else self.model.transcribe(str(clip))
             text = normalize_result(result)
             if stop.is_set():
                 raise Cancelled()
-            return Segment(segment.start, segment.end, text)
+            return Segment(segment.start, segment.end, text, segment.speaker)
 
-    def transcribe(self, source, stop, on_status, on_part, on_segment=None):
+    def transcribe(self, source, stop, on_status, on_part, on_segment=None, *, speaker_count=None):
         source = Path(source)
         if not source.is_file():
             raise ValueError('Аудиофайл не найден.')
-        if self.model is None or self.vad_model is None:
-            on_status('Загружаю модель в память...')
-            self.load()
         if stop.is_set():
             raise Cancelled()
         with tempfile.TemporaryDirectory(prefix='gigaam-audio-') as directory:
             wav = Path(directory) / 'audio.wav'
             on_status('Подготавливаю аудио...')
             convert_audio(source, wav, stop)
-            on_status('Ищу речь и паузы...')
-            ranges = detect_speech_ranges(wav, self.vad_model, stop, on_status)
+            if stop.is_set():
+                raise Cancelled()
+            if self.model is None or self.vad_model is None:
+                on_status('Загружаю модель в память...')
+                self.load()
+            if stop.is_set():
+                raise Cancelled()
+            ranges = None
+            turns = None
+            if speaker_count is None:
+                on_status('Ищу речь и паузы...')
+                ranges = detect_speech_ranges(wav, self.vad_model, stop, on_status)
+            else:
+                from speakers import detect_speakers
+                turns = detect_speakers(wav, speaker_count, stop, on_status)
+                if not turns:
+                    on_status('Ищу речь и паузы...')
+                    ranges = detect_speech_ranges(wav, self.vad_model, stop, on_status)
+                    turns = None
             on_status('Распознаю на компьютере...')
             return transcribe_wav(wav, self.model, stop, on_part, speech_ranges=ranges, on_segment=on_segment,
-                                  decode_pcm=self.decode_pcm)
+                                  decode_pcm=self.decode_pcm, speaker_turns=turns)
